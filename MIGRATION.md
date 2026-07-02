@@ -1,17 +1,25 @@
 # Upgrading Metabase
 
-This repo **is** the Heroku app that serves Metabase at `reports.grinta.eu`. It's a
-[buildpack](https://devcenter.heroku.com/articles/buildpacks): `bin/compile` downloads a
-pinned Metabase JAR at build time. The version is the single line in [`bin/version`](bin/version).
+Metabase runs at `reports.grinta.eu` on the Heroku app **`grinta-metabase`**. The deploy is split
+across **two repos** — an upgrade touches both:
 
-- **Heroku app:** `grinta-metabase` (git remote `production` → `git.heroku.com/grinta-metabase.git`)
-- **Source of truth:** GitHub `Grinta/metabase-buildpack` (git remote `origin`)
+| Repo | Role |
+|---|---|
+| **`metabase-buildpack`** (this repo) | Heroku buildpack. [`bin/version`](bin/version) pins the Metabase version; `bin/compile` downloads that Enterprise JAR at build time. |
+| **`metabase-deploy`** | The actual Heroku app pushed to `grinta-metabase`. Holds the `Procfile`, `bin/start` (JVM options + Heroku→Metabase env translation), `system.properties` (Java version), and `app.json` (Postgres addon + buildpack list). |
+
+The live app's buildpacks (`heroku buildpacks -a grinta-metabase`) are `heroku/jvm` +
+`https://github.com/grinta/metabase-buildpack` — so the version in **this** repo's `bin/version` is
+what actually gets deployed.
+
+**The upgrade in one sentence:** bump `bin/version` here → push a rebuild commit from
+`metabase-deploy` to Heroku. Everything else below is the safety around that: picking the right
+version, not losing data, and not tripping Heroku's boot timeout. The steps are generic — they work
+for any target version.
+
+- **Heroku app:** `grinta-metabase` (both repos have a git remote `production` → `git.heroku.com/grinta-metabase.git`)
 - **Edition:** Metabase **Enterprise/Pro** — the `1.x` version line (self-hosted)
 - **JAR source:** `https://downloads.metabase.com/enterprise/v<version>/metabase.jar`
-
-An upgrade is, at its core, **bump `bin/version` → deploy**. Everything else in this guide is the
-safety around that: picking the right version, not losing data, and not tripping Heroku's boot
-timeout. The steps are generic — they work for any target version.
 
 ---
 
@@ -78,20 +86,19 @@ Before a multi-major jump, skim the release notes for each major you're skipping
 ## Step 3 — Pre-flight checks (no downtime)
 
 ```sh
-# License is active Pro/Enterprise (required for AI + governance):
+# License is active Pro/Enterprise:
 #   Admin → Settings → License and Billing  in the web UI
 
 # Java version — Metabase 62 requires Java 21. Confirm what the app actually runs:
 heroku run "java -version" -a grinta-metabase
 ```
 
-**Java is provisioned on the Heroku app, not in this repo** (there's no `system.properties` here).
-If `java -version` is below 21, pin it before deploying: add a `system.properties` with
-`java.runtime.version=21` and make sure `heroku/jvm` is in `heroku buildpacks -a grinta-metabase`.
-This is the single most likely upgrade blocker.
+**Java is pinned in `metabase-deploy/system.properties`** (`java.runtime.version=21`), provisioned
+by the `heroku/jvm` buildpack. It's already on 21, which 62 needs. If a *future* Metabase version
+requires a newer JDK, bump it there and deploy that repo (Step 6).
 
 ```sh
-# Confirm the web process command (used again in rollback):
+# Confirm the dyno size (see "Sizing / memory" below) and buildpacks:
 heroku ps -a grinta-metabase
 heroku buildpacks -a grinta-metabase
 ```
@@ -113,28 +120,37 @@ are preserved by a same-DB upgrade. That's what keeps the partners-portal embeds
 
 ---
 
-## Step 5 — Bump the version
+## Step 5 — Bump the version (metabase-buildpack)
 
 ```sh
 cd ~/code/metabase-buildpack
 echo "1.62.3.5" > bin/version          # ← your Step 1 target
 git commit -am "bump metabase to 1.62.3.5"
-git push origin master                  # update GitHub first: Heroku fetches buildpack scripts from here
+git push origin master                  # Heroku fetches the buildpack from GitHub at build time
 ```
+
+Nothing is deployed yet — this only updates the pinned version. The rebuild happens in Step 6.
 
 ---
 
-## Step 6 — Run migrations on a one-off dyno (avoids the R10 boot timeout)
+## Step 6 — Deploy + migrate (metabase-deploy)
 
-**This is the critical Heroku-specific step.** A web dyno must bind `$PORT` within **60 seconds** or
-Heroku kills it (error R10). Migrating across several majors can take longer than that on first
-boot, causing a crash loop. Run the migration detached from the web dyno instead:
+The rebuild is triggered by pushing **`metabase-deploy`** to Heroku. Because the buildpack is
+fetched fresh from GitHub on every build, an **empty commit** is enough — Heroku re-runs
+`bin/compile`, which downloads the new JAR pinned in Step 5. (Our upgrade commits are empty by
+convention: `Upgrade to <version>`.)
+
+**Run migrations on a one-off dyno to avoid the R10 boot timeout.** A web dyno must bind `$PORT`
+within **60 seconds** or Heroku kills it (error R10). Migrating across several majors can take
+longer, causing a crash loop. Detach the migration from the web dyno:
 
 ```sh
+cd ~/code/metabase-deploy
 heroku maintenance:on -a grinta-metabase
 heroku ps:scale web=0 -a grinta-metabase
 
-# Deploy the new slug (builds with the new bin/version, but web stays down):
+# Trigger the rebuild (downloads the new JAR) without starting the web dyno:
+git commit --allow-empty -m "Upgrade to 1.62.3.5"
 git push production master
 
 # Apply schema migrations on a one-off dyno:
@@ -143,9 +159,9 @@ heroku run "java -jar target/uberjar/metabase.jar migrate up" -a grinta-metabase
 
 Wait for `migrate up` to finish without error.
 
-> Small single-major bumps usually boot inside 60s and don't strictly need this. When in doubt, do
-> it — it's free insurance. If you skip it, watch Step 7 logs for `R10 Boot timeout`; if you see it,
-> come back and run the `migrate up` above.
+> Small single-major bumps usually boot inside 60s and don't strictly need the `web=0` + `migrate
+> up` dance. When in doubt, do it — it's free insurance. If you skip it, watch Step 7 logs for `R10
+> Boot timeout`; if you see it, come back and run the `migrate up` above.
 
 ---
 
@@ -172,7 +188,9 @@ verify:
 1. Metabase → **Admin → Settings → Embedding**: static embedding still enabled, embedding secret
    unchanged.
 2. In the **partners portal**, load Orders, Revenues, and Inventories dashboards for a real
-   retailer. If they render, the integration is intact — no Grinta code change needed.
+   retailer. If they render, the integration is intact — no Grinta code change needed. (You can
+   confirm from the logs too: `heroku logs -a grinta-metabase | grep /api/embed/dashboard` should
+   show `202 [ASYNC: completed]` in a few hundred ms.)
 3. If an embed returns 401, the Metabase embedding secret changed. Restore it in Metabase to match
    Grinta's `METABASE_SECRET_KEY` config var. **Don't change the Grinta side.**
 
@@ -181,14 +199,18 @@ verify:
 ## Step 9 — Rollback (only if Steps 7–8 fail)
 
 ```sh
+# 1. Revert the version pin:
 cd ~/code/metabase-buildpack
-git revert HEAD --no-edit          # or: echo "<previous-version>" > bin/version && git commit -am "rollback"
+echo "<previous-version>" > bin/version      # e.g. 1.56.25
+git commit -am "rollback metabase to <previous-version>"
 git push origin master
-heroku ps:scale web=0 -a grinta-metabase
-git push production master          # redeploy the old JAR
 
-# Restore the DB from Step 4 — REQUIRED, the schema was migrated forward:
-heroku pg:backups -a grinta-metabase                 # find the backup id (e.g. b001)
+# 2. Redeploy the old JAR + restore the DB (the schema was migrated forward — restore is REQUIRED):
+cd ~/code/metabase-deploy
+heroku ps:scale web=0 -a grinta-metabase
+git commit --allow-empty -m "Rollback to <previous-version>"
+git push production master
+heroku pg:backups -a grinta-metabase                       # find the backup id (e.g. b001)
 heroku pg:backups:restore <id> DATABASE_URL -a grinta-metabase
 heroku ps:scale web=1 -a grinta-metabase
 heroku maintenance:off -a grinta-metabase
@@ -198,15 +220,22 @@ Then re-verify embeds (Step 8).
 
 ---
 
-## One-time: enabling the AI feature (Metabot)
+## Sizing / memory (R14)
 
-Metabot is included in our Pro plan but, because we self-host, it needs our own **Anthropic** API
-key (Metabase only supports Anthropic models). Available from Metabase 60+.
+Newer majors have a larger JVM footprint. Metabase **62 needs a ≥ 2.5 GB dyno**; the old 1 GB
+Standard-2X dyno hit `Error R14 (Memory quota exceeded)`, swapped, and made embedded dashboards
+crawl. Current sizing:
 
-1. **Admin → Settings → AI** → *bring your own API key* → paste an Anthropic API key.
-2. Enable **Metabot**.
-3. Set **token/message limits and per-group access** (governance, v61+) so open-ended queries can't
-   run up an unbounded Anthropic bill.
+- Dyno: **Performance-M** (2.5 GB) — `heroku ps:resize web=performance-m -a grinta-metabase`
+- Heap cap: **`JAVA_TOOL_OPTIONS=-Xmx2g`** config var, leaving ~500 MB for JVM off-heap / metaspace
+  / threads. Without an explicit cap the JVM sizes its heap off the host and can overrun the quota.
+  (Base JVM flags — G1GC, container support, etc. — live in `metabase-deploy/bin/start`.)
+
+After an upgrade, watch for R14 and bump the dyno / heap if it appears:
+
+```sh
+heroku logs -n 1500 -a grinta-metabase | grep -iE "R14|Memory quota"
+```
 
 ---
 
@@ -215,11 +244,11 @@ key (Metabase only supports Anthropic models). Available from Metabase 60+.
 ```
 [ ] Step 1  Find latest version (gh releases + download-server probe)
 [ ] Step 2  Confirm direct jump is allowed (≥ v40) + skim release notes
-[ ] Step 3  Pre-flight: license active, `java -version` is 21+
+[ ] Step 3  Pre-flight: license active, `java -version` is 21+, dyno ≥ 2.5 GB
 [ ] Step 4  heroku pg:backups:capture   ← mandatory
-[ ] Step 5  echo <version> > bin/version; commit; push origin
-[ ] Step 6  maintenance on; web=0; push production; run `migrate up`
+[ ] Step 5  metabase-buildpack: echo <version> > bin/version; commit; push origin
+[ ] Step 6  metabase-deploy: maintenance on; web=0; empty commit; push production; `migrate up`
 [ ] Step 7  web=1; maintenance off; tail logs; smoke-test UI
 [ ] Step 8  verify partners-portal embeds render
-[ ] Step 9  (only on failure) revert version + restore DB backup
+[ ] Step 9  (only on failure) revert version + redeploy + restore DB backup
 ```
