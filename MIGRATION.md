@@ -147,35 +147,76 @@ longer, causing a crash loop. Detach the migration from the web dyno:
 ```sh
 cd ~/code/metabase-deploy
 heroku maintenance:on -a grinta-metabase
-heroku ps:scale web=0 -a grinta-metabase
+heroku ps:scale web=0 -a grinta-metabase        # note the current count first: `heroku ps`
 
 # Trigger the rebuild (downloads the new JAR) without starting the web dyno:
 git commit --allow-empty -m "Upgrade to 1.62.3.5"
-git push production master
-
-# Apply schema migrations on a one-off dyno:
-heroku run "java -jar target/uberjar/metabase.jar migrate up" -a grinta-metabase
+git push production master --force              # see "Heroku git repo has diverged" below
 ```
 
-Wait for `migrate up` to finish without error.
+**The Heroku git repo has diverged from GitHub.** `production/master` still points at an abandoned
+`0.53.x` lineage (there are also stale `maste` and `upgrade` branches). GitHub is the source of
+truth — the Heroku repo is only a build input, so `--force` is expected here. Before forcing, sanity
+-check that you're not changing the runtime config out from under the app:
 
-> Small single-major bumps usually boot inside 60s and don't strictly need the `web=0` + `migrate
-> up` dance. When in doubt, do it — it's free insurance. If you skip it, watch Step 7 logs for `R10
-> Boot timeout`; if you see it, come back and run the `migrate up` above.
+```sh
+git fetch production
+git diff --stat production/master origin/master   # expect only README/docs — NOT Procfile,
+                                                  # bin/start or system.properties
+```
+
+Then let the **web dyno** run the migrations at boot (Step 7) while maintenance is still on. A boot
+under maintenance is contained: the router serves the maintenance page regardless of dyno state, so
+even an `R10 Boot timeout` crash-loop is invisible to users, and you can watch Liquibase in the logs.
+
+> **Don't use `heroku run … migrate up` blindly** — as written it fails *silently* two ways:
+> `heroku run` doesn't source `bin/start`, so `DATABASE_URL` is never translated to
+> `MB_DB_CONNECTION_URI` and Metabase falls back to a **throwaway H2 file** (look for `WARNING:
+> Using Metabase with an H2 application database`); and one-off dynos default to **standard-1x
+> (512 MB)** while `JAVA_TOOL_OPTIONS=-Xmx2g` asks for a 2 GB heap, so the dyno is killed by
+> `R15 (Memory quota vastly exceeded)` — and the CLI still exits **0**. If you do need it detached
+> from the web dyno (multi-major jump, long migration), run it like this:
+>
+> ```sh
+> heroku run --size performance-m \
+>   'MB_DB_CONNECTION_URI="$DATABASE_URL?ssl=true&sslmode=require&sslfactory=org.postgresql.ssl.NonValidatingFactory" \
+>    java -jar target/uberjar/metabase.jar migrate up' -a grinta-metabase
+> ```
+>
+> Never trust the exit code alone — verify against the DB (Step 7).
 
 ---
 
 ## Step 7 — Bring the web dyno back up
 
+Boot **one** dyno while maintenance is still on, and watch it migrate:
+
 ```sh
 heroku ps:scale web=1 -a grinta-metabase
-heroku maintenance:off -a grinta-metabase
-heroku logs -t -a grinta-metabase        # wait for "Metabase Initialization COMPLETE"
+heroku logs -n 400 -a grinta-metabase | grep -iE "migrat|Initialization COMPLETE|R1[045]"
 ```
 
-Because migrations already ran, boot is fast and stays under the timeout. Then load
-`https://reports.grinta.eu`, log in, and open a saved dashboard + a native question to confirm data
-sources survived.
+Verify the migrations actually landed — the app DB is the only source of truth here (replace `v63`
+with the major you're upgrading to; `dateexecuted` must be today):
+
+```sh
+heroku pg:psql -a grinta-metabase -c \
+  "select substring(id from 1 for 4) maj, count(*), max(dateexecuted) last
+     from databasechangelog group by 1 order by last desc limit 4;"
+```
+
+Then restore the **pre-upgrade dyno count** (it is `web=2`, not 1 — check Step 3's `heroku ps`
+output) and reopen:
+
+```sh
+heroku ps:scale web=2 -a grinta-metabase
+heroku maintenance:off -a grinta-metabase
+curl -s -o /dev/null -w "%{http_code}\n" https://reports.grinta.eu/api/health   # expect 200
+```
+
+Then load `https://reports.grinta.eu`, log in, and open a saved dashboard + a native question to
+confirm data sources survived. For reference, a 62 → 63 boot took **18 s** (JVM uptime 51 s) with
+66 Liquibase changesets, no `R14`.
 
 ---
 
@@ -185,14 +226,25 @@ The Grinta partners portal embeds dashboards via signed JWTs (`Partners::Metabas
 signed with `METABASE_SECRET_KEY`). Static/signed embedding is stable across upgrades, but always
 verify:
 
-1. Metabase → **Admin → Settings → Embedding**: static embedding still enabled, embedding secret
-   unchanged.
-2. In the **partners portal**, load Orders, Revenues, and Inventories dashboards for a real
-   retailer. If they render, the integration is intact — no Grinta code change needed. (You can
-   confirm from the logs too: `heroku logs -a grinta-metabase | grep /api/embed/dashboard` should
-   show `202 [ASYNC: completed]` in a few hundred ms.)
-3. If an embed returns 401, the Metabase embedding secret changed. Restore it in Metabase to match
-   Grinta's `METABASE_SECRET_KEY` config var. **Don't change the Grinta side.**
+1. The embedding secret still matches Grinta's `METABASE_SECRET_KEY` — compare fingerprints without
+   printing either secret:
+
+   ```sh
+   heroku pg:psql -a grinta-metabase -c \
+     "select md5(value) from setting where key = 'embedding-secret-key';"
+   grep '^METABASE_SECRET_KEY=' ~/code/grinta/.env | cut -d= -f2 | tr -d '\n' | md5
+   ```
+
+2. The dashboards the app actually embeds still render. Their ids live in
+   `grinta/config/metabase_dashboards.yml`; each locked param in `report_dashboard.embedding_params`
+   must be present in the signed token, then `GET /api/embed/dashboard/<jwt>` should return **200**
+   with a non-empty `dashcards`. A 401 means the embedding secret changed — restore it in Metabase to
+   match Grinta's config var, **don't change the Grinta side**. A 400 usually means a locked param is
+   missing from the token, not a broken upgrade.
+
+3. Finally, load Orders, Revenues, and Inventories in the **partners portal** for a real retailer.
+   (`heroku logs -a grinta-metabase | grep /api/embed/dashboard` should show `202 [ASYNC:
+   completed]` in a few hundred ms.)
 
 ---
 
@@ -209,10 +261,10 @@ git push origin master
 cd ~/code/metabase-deploy
 heroku ps:scale web=0 -a grinta-metabase
 git commit --allow-empty -m "Rollback to <previous-version>"
-git push production master
+git push production master --force
 heroku pg:backups -a grinta-metabase                       # find the backup id (e.g. b001)
 heroku pg:backups:restore <id> DATABASE_URL -a grinta-metabase
-heroku ps:scale web=1 -a grinta-metabase
+heroku ps:scale web=2 -a grinta-metabase                   # pre-upgrade count
 heroku maintenance:off -a grinta-metabase
 ```
 
@@ -244,11 +296,11 @@ heroku logs -n 1500 -a grinta-metabase | grep -iE "R14|Memory quota"
 ```
 [ ] Step 1  Find latest version (gh releases + download-server probe)
 [ ] Step 2  Confirm direct jump is allowed (≥ v40) + skim release notes
-[ ] Step 3  Pre-flight: license active, `java -version` is 21+, dyno ≥ 2.5 GB
+[ ] Step 3  Pre-flight: license active, `java -version` is 21+, dyno ≥ 2.5 GB, note dyno COUNT
 [ ] Step 4  heroku pg:backups:capture   ← mandatory
 [ ] Step 5  metabase-buildpack: echo <version> > bin/version; commit; push origin
-[ ] Step 6  metabase-deploy: maintenance on; web=0; empty commit; push production; `migrate up`
-[ ] Step 7  web=1; maintenance off; tail logs; smoke-test UI
-[ ] Step 8  verify partners-portal embeds render
+[ ] Step 6  metabase-deploy: maintenance on; web=0; empty commit; push production --force
+[ ] Step 7  web=1 (still in maintenance) → check databasechangelog → web=2; maintenance off
+[ ] Step 8  verify embed secret md5 + /api/embed/dashboard 200 + partners portal
 [ ] Step 9  (only on failure) revert version + redeploy + restore DB backup
 ```
