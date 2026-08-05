@@ -312,8 +312,8 @@ heroku pg:psql -a grinta-metabase -c \
 
 **Revoking sessions: use `DELETE`, not `TRUNCATE`.** Advisories tell you to
 `TRUNCATE TABLE core_session`. On our schema that **fails**: `login_history.session_id` has a
-foreign key to `core_session`, so Postgres refuses and suggests `CASCADE`. Do **not** use `CASCADE`
-— it would wipe `login_history` (184k+ rows), which is exactly the forensic trail the same advisory
+foreign key to `core_session`, so Postgres refuses and suggests `CASCADE`. Do **not** use `CASCADE`:
+it would wipe `login_history` (184k+ rows), which is exactly the forensic trail the same advisory
 asks you to review. The FK is `ON DELETE SET NULL`, so a plain `DELETE` revokes every session and
 keeps the audit trail intact:
 
