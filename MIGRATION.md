@@ -151,17 +151,22 @@ heroku ps:scale web=0 -a grinta-metabase        # note the current count first: 
 
 # Trigger the rebuild (downloads the new JAR) without starting the web dyno:
 git commit --allow-empty -m "Upgrade to 1.62.3.5"
-git push production master --force              # see "Heroku git repo has diverged" below
+git push origin master                          # GitHub is the source of truth: push there too
+git push production master                      # see "branch state" below
 ```
 
-**The Heroku git repo has diverged from GitHub.** `production/master` still points at an abandoned
-`0.53.x` lineage (there are also stale `maste` and `upgrade` branches). GitHub is the source of
-truth — the Heroku repo is only a build input, so `--force` is expected here. Before forcing, sanity
--check that you're not changing the runtime config out from under the app:
+**Branch state.** As of the 1.63.3 upgrade, `production/master` and `origin/master` are
+**identical**, so this is a plain fast-forward and `--force` is no longer needed. The divergence
+that used to require it was resolved by the 1.63.1.6 deploy. Two traps remain:
+
+- The Heroku repo's `HEAD` is **`main`**, which still points at the old `1.62.3.5` lineage, and
+  there are stale `maste` and `upgrade` branches. A fresh `git clone` of the Heroku remote checks
+  out `main`, *not* the deployed branch. Always deploy `master`.
+- Verify before pushing, and only reach for `--force` if the branches have diverged again:
 
 ```sh
 git fetch production
-git diff --stat production/master origin/master   # expect only README/docs — NOT Procfile,
+git diff --stat production/master origin/master   # expect empty, or only README/docs. NOT Procfile,
                                                   # bin/start or system.properties
 ```
 
@@ -197,13 +202,26 @@ heroku logs -n 400 -a grinta-metabase | grep -iE "migrat|Initialization COMPLETE
 ```
 
 Verify the migrations actually landed — the app DB is the only source of truth here (replace `v63`
-with the major you're upgrading to; `dateexecuted` must be today):
+with the major you're upgrading to):
 
 ```sh
 heroku pg:psql -a grinta-metabase -c \
   "select substring(id from 1 for 4) maj, count(*), max(dateexecuted) last
      from databasechangelog group by 1 order by last desc limit 4;"
 ```
+
+**What "landed" means depends on the hop.** For a **major** upgrade (62 → 63) expect new changesets
+with `dateexecuted` = today. For a **patch within the same major** (1.63.1.6 → 1.63.3) expect
+**zero** new changesets and a `last` timestamp from the *previous* upgrade. That is correct, not a
+failed migration. The authoritative signal is the boot log either way:
+
+```sh
+heroku logs -n 1500 --dyno web.1 -a grinta-metabase | grep -iE "liquibase|Migrations Current|unrun"
+# patch bump  -> "No unrun migrations found." + "Database Migrations Current ... OK"
+# major bump  -> a run of applied changesets
+```
+
+Note `heroku logs` without `--dyno web.1` is drowned out by Postgres addon logs, so always filter.
 
 Then restore the **pre-upgrade dyno count** (it is `web=2`, not 1 — check Step 3's `heroku ps`
 output) and reopen:
@@ -272,6 +290,60 @@ Then re-verify embeds (Step 8).
 
 ---
 
+## Emergency upgrades (security advisories)
+
+When the driver is a CVE rather than a feature, two extras apply.
+
+**Confirm the instance is actually affected.** Advisories are usually written for Metabase Cloud;
+ours is **self-hosted**, which changes who does the patching. Check both facts from one endpoint:
+
+```sh
+curl -s https://reports.grinta.eu/api/session/properties \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['version'], d['token-features']['hosting'])"
+# hosting=False confirms self-hosted: nobody patches this for us.
+```
+
+Metabase's own version check also records a hit in the audit log, which is a useful corroboration:
+
+```sh
+heroku pg:psql -a grinta-metabase -c \
+  "select timestamp, topic from audit_log where topic = 'security-advisory-match' order by 1 desc limit 5;"
+```
+
+**Revoking sessions: use `DELETE`, not `TRUNCATE`.** Advisories tell you to
+`TRUNCATE TABLE core_session`. On our schema that **fails**: `login_history.session_id` has a
+foreign key to `core_session`, so Postgres refuses and suggests `CASCADE`. Do **not** use `CASCADE`
+— it would wipe `login_history` (184k+ rows), which is exactly the forensic trail the same advisory
+asks you to review. The FK is `ON DELETE SET NULL`, so a plain `DELETE` revokes every session and
+keeps the audit trail intact:
+
+```sh
+heroku pg:psql -a grinta-metabase -c "DELETE FROM core_session;"
+heroku pg:psql -a grinta-metabase -c "select count(*) from login_history;"   # must be unchanged
+```
+
+This logs every human out of Metabase but does **not** affect the partners-portal embeds, which are
+signed JWTs rather than sessions. Verify with Step 8 regardless.
+
+**Triage queries for "was I compromised".** New admins, new API keys, and unexpected activity:
+
+```sh
+heroku pg:psql -a grinta-metabase -c \
+  "select id, email, is_superuser, is_active, date_joined from core_user
+     where date_joined > now() - interval '30 days' order by date_joined;"
+heroku pg:psql -a grinta-metabase -c "select id, name, user_id, created_at from api_key order by created_at;"
+heroku pg:psql -a grinta-metabase -c \
+  "select topic, count(*), max(timestamp) last from audit_log
+     where timestamp > now() - interval '7 days' group by 1 order by 2 desc;"
+```
+
+> **Known gap:** the app has **no log drain**, so Heroku router logs are ephemeral. You cannot
+> retrospectively check whether an attacked endpoint (e.g. `/api/session/reset_password`) was hit.
+> Advisory steps of the "review your access logs" kind are unanswerable today. Adding a drain is the
+> fix; until then, treat session/key hygiene as the compensating control.
+
+---
+
 ## Sizing / memory (R14)
 
 Newer majors have a larger JVM footprint. Metabase **62 needs a ≥ 2.5 GB dyno**; the old 1 GB
@@ -299,8 +371,11 @@ heroku logs -n 1500 -a grinta-metabase | grep -iE "R14|Memory quota"
 [ ] Step 3  Pre-flight: license active, `java -version` is 21+, dyno ≥ 2.5 GB, note dyno COUNT
 [ ] Step 4  heroku pg:backups:capture   ← mandatory
 [ ] Step 5  metabase-buildpack: echo <version> > bin/version; commit; push origin
-[ ] Step 6  metabase-deploy: maintenance on; web=0; empty commit; push production --force
-[ ] Step 7  web=1 (still in maintenance) → check databasechangelog → web=2; maintenance off
+[ ] Step 6  metabase-deploy: maintenance on; web=0; empty commit; push origin + production master
+[ ] Step 7  web=1 (still in maintenance) → check boot log for migrations → web=2; maintenance off
 [ ] Step 8  verify embed secret md5 + /api/embed/dashboard 200 + partners portal
 [ ] Step 9  (only on failure) revert version + redeploy + restore DB backup
+
+Security advisory? Also: confirm hosting=False + affected version, then after Step 8
+DELETE FROM core_session (never TRUNCATE), and review new admins / API keys.
 ```
