@@ -50,15 +50,15 @@ gh api "repos/metabase/metabase/releases?per_page=15" \
 The top `v0.MAJOR.MINOR` is the newest release. (Or read <https://www.metabase.com/releases>.)
 The EE equivalent is `1.MAJOR.MINOR`.
 
-**b) Newest EE hotfix build** — probe the download server, incrementing the 4th digit until it
-404s. The server 404s correctly on non-existent versions, so a `200` means a real JAR:
+**b) Newest EE hotfix build** — probe the download server across the whole 4th-digit range. The
+server 404s correctly on non-existent versions, so a `200` means a real JAR:
 
 ```sh
 # Sanity-check the server 404s on a bogus version FIRST (guards against false 200s):
 curl -s -o /dev/null -I -w "%{http_code}\n" -L \
   https://downloads.metabase.com/enterprise/v1.99.99.99/metabase.jar   # must print 404
 
-# Then walk the hotfix builds of the target release until you hit a 404:
+# Then probe EVERY hotfix build of the target release. Do not stop at the first 404:
 for n in "" .1 .2 .3 .4 .5 .6 .7 .8; do
   v="1.62.3$n"
   code=$(curl -s -o /dev/null -I -w "%{http_code}" -L \
@@ -67,8 +67,12 @@ for n in "" .1 .2 .3 .4 .5 .6 .7 .8; do
 done
 ```
 
-The **highest version that returns `200`** is your target. (Cross-check: file sizes increase
-build-over-build; a sudden `404` is the ceiling.)
+The **highest version that returns `200`** is your target.
+
+> **The range is not contiguous: never stop at the first 404.** At the 1.63.5 upgrade the probe
+> returned `1.63.5 -> 200`, `1.63.5.1 -> 404`, `1.63.5.2 -> 200`, then 404s. A loop that breaks on
+> the first miss would have picked `1.63.5` and silently skipped two builds' worth of fixes. Read
+> the whole table before choosing. (Cross-check: file sizes increase build-over-build.)
 
 ---
 
@@ -155,7 +159,7 @@ git push origin master                          # GitHub is the source of truth:
 git push production master                      # see "branch state" below
 ```
 
-**Branch state.** As of the 1.63.3 upgrade, `production/master` and `origin/master` are
+**Branch state.** As of the 1.63.5.2 upgrade, `production/master` and `origin/master` are
 **identical**, so this is a plain fast-forward and `--force` is no longer needed. The divergence
 that used to require it was resolved by the 1.63.1.6 deploy. Two traps remain:
 
@@ -200,6 +204,18 @@ Boot **one** dyno while maintenance is still on, and watch it migrate:
 heroku ps:scale web=1 -a grinta-metabase
 heroku logs -n 400 -a grinta-metabase | grep -iE "migrat|Initialization COMPLETE|R1[045]"
 ```
+
+> **Don't poll `/api/health` for the boot signal while maintenance is on** — Heroku intercepts at
+> the router, so the custom domain returns `503` no matter how healthy the dyno is. Waiting on it
+> looks like a hung boot. The boot log is the only signal until Step 7 reopens the app; wait for
+> `Metabase Initialization COMPLETE`, then check the version the dyno actually started:
+>
+> ```sh
+> heroku logs -n 2000 --dyno web.1 -a grinta-metabase | grep -i "Starting Metabase version"
+> ```
+>
+> Beware the `*.herokuapp.com` host: it can answer `/api/health` with `ok` while maintenance is on
+> and the custom domain 503s, so a green check there proves nothing about what users see.
 
 Verify the migrations actually landed — the app DB is the only source of truth here (replace `v63`
 with the major you're upgrading to):
@@ -310,6 +326,34 @@ heroku pg:psql -a grinta-metabase -c \
   "select timestamp, topic from audit_log where topic = 'security-advisory-match' order by 1 desc limit 5;"
 ```
 
+**Contain before you deploy.** The upgrade takes ~10 minutes end to end; if the advisory names a
+precondition you can remove with one `UPDATE`, do that first and deploy second. For the 1.63.5
+advisories the precondition was a public link exposing a field-filter (`dimension`) parameter. This
+finds every one of them, whether shared directly or reachable through a public dashboard:
+
+```sh
+heroku pg:psql -a grinta-metabase -c "
+select c.id, left(c.name,40) name, (c.public_uuid is not null) as direct_public
+from report_card c
+where (c.public_uuid is not null
+       or exists(select 1 from report_dashboard d join report_dashboardcard dc on dc.dashboard_id=d.id
+                 where d.public_uuid is not null and dc.card_id=c.id))
+  and c.dataset_query::text like '%dimension%';"
+```
+
+The join table is `report_dashboardcard`, **not** `dashboardcard`. Record `public_uuid` and
+`made_public_by_id` before nulling them so the link can be restored verbatim afterwards.
+
+Note that public sharing is **on** for this instance and there are normally ~13 public cards and
+~8 public dashboards, so "do we have public links" is always yes. The question is only ever whether
+any of them expose a field filter.
+
+**Stored DB credentials are in plaintext.** `MB_ENCRYPTION_SECRET_KEY` is not set, which the boot
+log states outright (`Saved credentials encryption is DISABLED for this Metabase instance. 🔓`).
+Any advisory whose impact includes reading the application database therefore also means the
+**Grinta Production** and **DWH** connection credentials were readable, with no further work by the
+attacker. Weigh rotation accordingly rather than treating it as a theoretical step.
+
 **Revoking sessions: use `DELETE`, not `TRUNCATE`.** Advisories tell you to
 `TRUNCATE TABLE core_session`. On our schema that **fails**: `login_history.session_id` has a
 foreign key to `core_session`, so Postgres refuses and suggests `CASCADE`. Do **not** use `CASCADE`:
@@ -361,6 +405,14 @@ After an upgrade, watch for R14 and bump the dyno / heap if it appears:
 heroku logs -n 1500 -a grinta-metabase | grep -iE "R14|Memory quota"
 ```
 
+> **Performance-M is already too small at current load: R14 is the steady state, not a
+> post-upgrade symptom.** Immediately before the 1.63.5.2 upgrade, both dynos were running at
+> `mem=3249M (126.4%)` and `mem=3167M (123.2%)` and emitting R14 every ~21 s. Two consequences when
+> you run this grep after an upgrade: **check the timestamps against your new dynos' start times**,
+> or you will attribute pre-existing R14s to your deploy; and a freshly booted dyno is quiet for
+> the first several minutes, so "no R14 yet" is not proof the upgrade is clean. The real fix is
+> Performance-L or a lower `-Xmx`; until then this section's "≥ 2.5 GB" is understated.
+
 ---
 
 ## Quick checklist
@@ -376,6 +428,7 @@ heroku logs -n 1500 -a grinta-metabase | grep -iE "R14|Memory quota"
 [ ] Step 8  verify embed secret md5 + /api/embed/dashboard 200 + partners portal
 [ ] Step 9  (only on failure) revert version + redeploy + restore DB backup
 
-Security advisory? Also: confirm hosting=False + affected version, then after Step 8
+Security advisory? First: confirm hosting=False + affected version, and remove the precondition
+(e.g. unpublish public links with field filters) BEFORE Step 4. Then after Step 8
 DELETE FROM core_session (never TRUNCATE), and review new admins / API keys.
 ```
