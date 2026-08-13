@@ -40,15 +40,28 @@ hotfix build — always prefer the **highest** hotfix of the target release.
 
 Two questions: what's the newest `MAJOR.MINOR`, and what's the newest EE hotfix build of it.
 
-**a) Newest release (`MAJOR.MINOR`)** — GitHub releases are date-sorted and authoritative:
+**a) Newest release (`MAJOR.MINOR`)** — ask the **EE version feed** first. It names the current
+Enterprise release directly, so there is no `0.x` to `1.x` translation step:
+
+```sh
+curl -s https://static.metabase.com/version-info-ee.json \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['latest']['version'])"
+```
+
+GitHub releases are a **cross-check, not the source of truth**, and they lag:
 
 ```sh
 gh api "repos/metabase/metabase/releases?per_page=15" \
   --jq '.[] | "\(.tag_name)\t\(.published_at)"'
 ```
 
-The top `v0.MAJOR.MINOR` is the newest release. (Or read <https://www.metabase.com/releases>.)
-The EE equivalent is `1.MAJOR.MINOR`.
+> **GitHub can be behind by an entire security release.** At the 1.63.10 upgrade the newest GitHub
+> release was `v0.63.2` (2026-07-29), while the EE feed already had `v1.63.10` (2026-08-11), which
+> was the fix for the advisory driving that very upgrade. Following Step 1a's GitHub result would
+> have landed on a still-vulnerable build. When an advisory is the trigger, cross-check the feed
+> against the fixed versions the advisory itself lists: the feed's `older[]` carried
+> `1.62.13 / 1.61.15 / 1.60.21 / 1.59.25 / 1.58.28`, matching the advisory's per-line fixes exactly,
+> which is a strong signal the feed reflects the security release.
 
 **b) Newest EE hotfix build** — probe the download server across the whole 4th-digit range. The
 server 404s correctly on non-existent versions, so a `200` means a real JAR:
